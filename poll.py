@@ -22,7 +22,7 @@ def query_gpu(fields, gpuid=None, keep_newlines=False):
 def initialize():
     """query each device for limits and capacities"""
     global gpuids, limits
-    ngpu = int(query_gpu(['count']))
+    ngpu = int(query_gpu(['count'], 0))
     gpuids = list(range(ngpu))
     print('Identified '+str(ngpu)+' GPU(s)')
 
@@ -31,6 +31,7 @@ def initialize():
     for gpuid in gpuids:
         q = query_gpu(['gpu_name','gpu_serial','gpu_uuid','memory.total','power.limit'], gpuid).split(',')
         temp_lims = bytes.decode(subprocess.check_output('nvidia-smi -q --display=TEMPERATURE | awk \'BEGIN{FS=" *: *";OFS=","}; /Shutdown Temp/ {sub(" C","",$2); stop=$2}; /Slowdown Temp/ {sub(" C", "", $2); slow=$2}; END{OFS=","; print slow,stop}\'', shell=True), 'utf-8').replace('\n','').split(',')
+        map(str.strip, temp_lims)
         d = {}
         d['model']  = q[0]
         d['serial'] = q[1]
@@ -50,8 +51,8 @@ def query(sc, qidx):
     qidx += 1
     for gpuid in gpuids:
         args = ['nvidia-smi', '--format=csv,noheader,nounits', '--id='+str(gpuid), '--query-gpu='+','.join(query_fields)]
-        result = run(args, stderr=STDOUT, stdout=PIPE, encoding='utf-8')
-        print(str(gpuid) + ': ' + result.stdout.replace('\n',''))
+        result = run(args, stderr=STDOUT, stdout=PIPE)
+        print(str(gpuid) + ': ' + bytes.decode(result.stdout, 'utf-8').replace('\n',''))
     if (qidx < n_avgs):
         sc.enter(avg_poll_interval, 1, query, (sc,qidx))
 
