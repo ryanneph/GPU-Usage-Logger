@@ -18,6 +18,12 @@ logger.addHandler(logging.FileHandler(os.path.join(LOGS, 'poll.log')))
 
 # connect to mongodb
 dbclient = MongoClient('localhost', 3001)
+try:
+    dbclient.admin.command('ismaster')
+except Exception as e:
+    logger.warning("Connecting to fallback database")
+    dbclient = MongoClient()
+    dbclient.admin.command('ismaster')
 db = dbclient['meteor']
 db_gpu_usage = db['gpu_usage']
 db_gpu_props = db['gpu_props']
