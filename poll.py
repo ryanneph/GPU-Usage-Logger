@@ -1,13 +1,41 @@
+import sys, os
+import logging
 import subprocess
 from subprocess import run, PIPE, STDOUT
 import sched
 import datetime, time
+from pymongo import MongoClient
 
-avg_poll_interval = 0.1 # [unit: secs]
-n_avgs            = 20
-log_poll_interval = 10   # [unit: secs]
-query_fields = ['power.draw', 'temperature.gpu', '']
+# Fixed paths
+LOGS = './logs/'
+os.makedirs(LOGS, exist_ok=True)
+
+# setup logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logger.addHandler(logging.StreamHandler(sys.stdout))
+logger.addHandler(logging.FileHandler(os.path.join(LOGS, 'poll.log')))
+
+# connect to mongodb
+dbclient = MongoClient('localhost', 3001)
+db = dbclient['meteor']
+db_gpu_usage = db['gpu_usage']
+db_gpu_props = db['gpu_props']
+
+# configuration
+sample_poll_interval = 0.1 # time between samples in avg [unit: secs]
+n_samples            = 20  # number of samples included in each average
+log_poll_interval    = 10  # time between averages [unit: secs]
+query_fields = ['power.draw', 'temperature.gpu'] # nvidia-smi fields to query
+
+# dynamically set
 gpuids = [] # replace with query on startup
+db_fields = list(map(lambda x: str.replace(x,'.','_'), query_fields))
+
+def clear_db():
+    logger.debug("Deleting all data from database")
+    db_gpu_props.delete_many({})
+    db_gpu_usage.delete_many({})
 
 def query_gpu(fields, gpuid=None, keep_newlines=False):
     """query all or a specific gpu for information and return as string"""
@@ -21,54 +49,84 @@ def query_gpu(fields, gpuid=None, keep_newlines=False):
 
 def initialize():
     """query each device for limits and capacities"""
-    global gpuids, limits
+    global gpuids
     ngpu = int(query_gpu(['count'], 0))
     gpuids = list(range(ngpu))
-    print('Identified '+str(ngpu)+' GPU(s)')
+    logger.info('Identified '+str(ngpu)+' GPU(s)')
 
     # query static limits for temp, power ...
-    gpu_details = {}
     for gpuid in gpuids:
-        q = query_gpu(['gpu_name','gpu_serial','gpu_uuid','memory.total','power.limit'], gpuid).split(',')
+        q = list(map(str.strip, query_gpu(['gpu_name','gpu_serial','gpu_uuid','memory.total','power.limit'], gpuid).split(',')))
         temp_lims = bytes.decode(subprocess.check_output('nvidia-smi -q --display=TEMPERATURE | awk \'BEGIN{FS=" *: *";OFS=","}; /Shutdown Temp/ {sub(" C","",$2); stop=$2}; /Slowdown Temp/ {sub(" C", "", $2); slow=$2}; END{OFS=","; print slow,stop}\'', shell=True), 'utf-8').replace('\n','').split(',')
         map(str.strip, temp_lims)
-        d = {}
-        d['model']  = q[0]
-        d['serial'] = q[1]
-        d['uuid']   = q[2]
-        d['limits'] = {
-            'memory': q[3],    # [unit: MiB]
-            'power':  q[4],     # [unit: W]
-            'temperature': {    # [unit: C]
-                'slowdown': temp_lims[0],
-                'shutdown': temp_lims[1],
-            },
+        d_fixed = {
+            'gpuid': gpuid,
+            'model': q[0],
+            'serial': q[1],
+            'uuid': q[2],
         }
-        gpu_details[gpuid] = d
-        print(d)
+        d_variable = {
+            'limits': {
+                'memory': float(q[3]), # [unit: MiB]
+                'power':  float(q[4]), # [unit: W]
+                'temperature': {       # [unit: C]
+                    'slowdown': float(temp_lims[0]),
+                    'shutdown': float(temp_lims[1]),
+                },
+            }
+        }
+        logger.info({**d_fixed, **d_variable})
+        db_gpu_props.update_one({'uuid': d_fixed['uuid']}, {'$set': d_variable, '$setOnInsert': d_fixed}, upsert=True)
+        # TODO: check for existing props before adding
 
-def query(sc, qidx):
-    qidx += 1
+def get_sample(sc, idx, samples):
+    idx += 1
     for gpuid in gpuids:
         args = ['nvidia-smi', '--format=csv,noheader,nounits', '--id='+str(gpuid), '--query-gpu='+','.join(query_fields)]
         result = run(args, stderr=STDOUT, stdout=PIPE)
-        print(str(gpuid) + ': ' + bytes.decode(result.stdout, 'utf-8').replace('\n',''))
-    if (qidx < n_avgs):
-        sc.enter(avg_poll_interval, 1, query, (sc,qidx))
+        data = list(map(str.strip, bytes.decode(result.stdout, 'utf-8').replace('\n','').split(',')))
+        log_data = {
+            'time': datetime.datetime.now().strftime(' %Y-%m-%d %H:%M:%S:%f'),
+            'gpuid': gpuid,
+            **{db_fields[i]: data[i] for i in range(len(db_fields))}
+        }
+        #  print(log_data)
+        samples[gpuid].append(log_data)
+        #  db_gpu_usage.insert_one(log_data)
+    if (idx < n_samples):
+        sc.enter(sample_poll_interval, 1, get_sample, (sc,idx,samples))
 
-def log(sc):
+def get_average(sc):
     # initialize and start average polling
-    print("acquiring average\n"+','.join(query_fields))
-    sc_avg = sched.scheduler(time.time, time.sleep)
-    avgidx = 0
-    sc_avg.enter(0, 1, query, (sc_avg,avgidx))
-    sc_avg.run()
-    sc.enter(log_poll_interval, 1, log, (sc,))
+    sc_sample = sched.scheduler(time.time, time.sleep)
+    sampleidx = 0
+    samples = [[]*len(gpuids)]
+    sc_sample.enter(0, 1, get_sample, (sc_sample,sampleidx,samples))
+    sc_sample.run()
+
+    # combine samples into average
+    dbdata = []
+    for gpusamples in samples:
+        avg = gpusamples[-1].copy()
+        for sample in gpusamples[:-1]:
+            for field in db_fields:
+                avg[field] = float(avg[field]) + float(sample[field])
+        for field in db_fields:
+            avg[field] /= len(gpusamples)
+        logger.debug('Average: ' + str(avg))
+        dbdata.append(avg)
+
+    # commit to database
+    db_gpu_usage.insert_many(dbdata)
+
+    # loop indefinitely
+    sc.enter(log_poll_interval, 1, get_average, (sc,))
 
 
 if __name__ == '__main__':
     # initialize and start log polling
     initialize()
+    logger.info("polling...")
     sc_log = sched.scheduler(time.time, time.sleep)
-    sc_log.enter(0, 1, log, (sc_log,))
+    sc_log.enter(0, 1, get_average, (sc_log,))
     sc_log.run()
