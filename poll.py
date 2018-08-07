@@ -29,10 +29,10 @@ db_gpu_usage = db['gpu_usage']
 db_gpu_props = db['gpu_props']
 
 # configuration
-sample_poll_interval = 0.1 # time between samples in avg [unit: secs]
-n_samples            = 20  # number of samples included in each average
-log_poll_interval    = 10  # time between averages [unit: secs]
-query_fields = ['power.draw', 'temperature.gpu'] # nvidia-smi fields to query
+sample_poll_interval = 1 # time between samples in avg [unit: secs]
+n_samples            = 3  # number of samples included in each average
+log_poll_interval    = 60  # time between averages [unit: secs]
+query_fields = ['utilization.gpu', 'utilization.memory', 'clocks.current.video', 'clocks.current.graphics', 'clocks.current.memory', 'clocks.current.sm', 'memory.total', 'memory.used', 'memory.free', 'fan.speed', 'power.draw', 'temperature.gpu'] # nvidia-smi fields to query
 
 # dynamically set
 gpuids = [] # replace with query on startup
@@ -48,10 +48,12 @@ def query_gpu(fields, gpuid=None, keep_newlines=False):
     args = ['nvidia-smi', '--query-gpu={!s}'.format(','.join(fields)), '--format=csv,noheader,nounits']
     if gpuid is not None:
         args.insert(1, '--id={:d}'.format(int(gpuid)))
-    result = bytes.decode(subprocess.check_output(args), 'utf-8')
+    raw_result = bytes.decode(subprocess.check_output(args), 'utf-8')
     if not keep_newlines:
-        result = result.replace('\n','')
-    return result
+        raw_result = raw_result.replace('\n','')
+    result = list(map(str.strip, raw_result.split(',')))
+    if len(result)<2: return result[0]
+    else: return result
 
 def initialize():
     """query each device for limits and capacities"""
@@ -62,7 +64,7 @@ def initialize():
 
     # query static limits for temp, power ...
     for gpuid in gpuids:
-        q = list(map(str.strip, query_gpu(['gpu_name','gpu_serial','gpu_uuid','memory.total','power.limit'], gpuid).split(',')))
+        q = query_gpu(['gpu_name','gpu_serial','gpu_uuid','memory.total','power.limit'], gpuid)
         temp_lims = bytes.decode(subprocess.check_output('nvidia-smi -q --display=TEMPERATURE | awk \'BEGIN{FS=" *: *";OFS=","}; /Shutdown Temp/ {sub(" C","",$2); stop=$2}; /Slowdown Temp/ {sub(" C", "", $2); slow=$2}; END{OFS=","; print slow,stop}\'', shell=True), 'utf-8').replace('\n','').split(',')
         map(str.strip, temp_lims)
         d_fixed = {
@@ -88,15 +90,14 @@ def initialize():
 def get_sample(sc, idx, samples):
     idx += 1
     for gpuid in gpuids:
-        args = ['nvidia-smi', '--format=csv,noheader,nounits', '--id='+str(gpuid), '--query-gpu='+','.join(query_fields)]
-        result = run(args, stderr=STDOUT, stdout=PIPE)
-        data = list(map(str.strip, bytes.decode(result.stdout, 'utf-8').replace('\n','').split(',')))
+        dev_fields = ['serial', 'uuid']
+        dev_result = query_gpu(dev_fields, gpuid=gpuid)
+        data = query_gpu(query_fields, gpuid=gpuid)
         log_data = {
-            'time': datetime.datetime.now().strftime(' %Y-%m-%d %H:%M:%S:%f'),
-            'gpuid': gpuid,
-            **{db_fields[i]: data[i] for i in range(len(db_fields))}
+            'time': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S:%f'),
+            **{dev_fields[i]: dev_result[i] for i in range(len(dev_fields))},
+            **{db_fields[i]: data[i] for i in range(len(db_fields))},
         }
-        #  print(log_data)
         samples[gpuid].append(log_data)
         #  db_gpu_usage.insert_one(log_data)
     if (idx < n_samples):
