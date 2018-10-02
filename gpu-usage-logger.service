@@ -1,0 +1,16 @@
+[Unit]
+Description=GPU Usage Logger
+Requires=gpu-usage-logger-mongodb.service
+After=gpu-usage-logger-mongodb.service
+
+[Service]
+Type=simple
+WorkingDirectory=/raid/ryanneph/opt/GPU-Usage-Logger
+ExecStart=/usr/local/bin/pipenv run python /raid/ryanneph/opt/GPU-Usage-Logger/poll.py
+
+Restart=on-failure
+RestartSec=20s
+
+[Install]
+WantedBy=multi-user.target
+

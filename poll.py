@@ -17,12 +17,12 @@ logger.addHandler(logging.StreamHandler(sys.stdout))
 logger.addHandler(logging.FileHandler(os.path.join(LOGS, 'poll.log')))
 
 # connect to mongodb
-dbclient = MongoClient('localhost', 3001)
+dbclient = MongoClient('localhost', 3001, connect=True, serverSelectionTimeoutMS=2000)
 try:
     dbclient.admin.command('ismaster')
 except Exception as e:
     logger.warning("Connecting to fallback database")
-    dbclient = MongoClient()
+    dbclient = MongoClient('localhost', 27117, connect=True, serverSelectionTimeoutMS=2000)
     dbclient.admin.command('ismaster')
 db = dbclient['meteor']
 db_gpu_usage = db['gpu_usage']
@@ -31,8 +31,8 @@ db_gpu_props = db['gpu_props']
 # configuration
 sample_poll_interval = 1 # time between samples in avg [unit: secs]
 n_samples            = 3  # number of samples included in each average
-log_poll_interval    = 60  # time between averages [unit: secs]
-query_fields = ['utilization.gpu', 'utilization.memory', 'clocks.current.video', 'clocks.current.graphics', 'clocks.current.memory', 'clocks.current.sm', 'memory.total', 'memory.used', 'memory.free', 'fan.speed', 'power.draw', 'temperature.gpu'] # nvidia-smi fields to query
+log_poll_interval    = 58  # time between averages [unit: secs]
+query_fields = ['utilization.gpu', 'utilization.memory', 'clocks.current.video', 'clocks.current.graphics', 'clocks.current.memory', 'clocks.current.sm', 'memory.used', 'memory.free', 'fan.speed', 'power.draw', 'temperature.gpu'] # nvidia-smi fields to query
 
 # dynamically set
 gpuids = [] # replace with query on startup
@@ -89,7 +89,7 @@ def initialize():
 
 def get_sample(sc, idx, samples):
     idx += 1
-    for gpuid in gpuids:
+    for ii, gpuid in enumerate(gpuids):
         dev_fields = ['serial', 'uuid']
         dev_result = query_gpu(dev_fields, gpuid=gpuid)
         data = query_gpu(query_fields, gpuid=gpuid)
@@ -98,7 +98,7 @@ def get_sample(sc, idx, samples):
             **{dev_fields[i]: dev_result[i] for i in range(len(dev_fields))},
             **{db_fields[i]: data[i] for i in range(len(db_fields))},
         }
-        samples[gpuid].append(log_data)
+        samples[ii].append(log_data)
         #  db_gpu_usage.insert_one(log_data)
     if (idx < n_samples):
         sc.enter(sample_poll_interval, 1, get_sample, (sc,idx,samples))
@@ -107,7 +107,7 @@ def get_average(sc):
     # initialize and start average polling
     sc_sample = sched.scheduler(time.time, time.sleep)
     sampleidx = 0
-    samples = [[]*len(gpuids)]
+    samples = [list() for _ in gpuids]
     sc_sample.enter(0, 1, get_sample, (sc_sample,sampleidx,samples))
     sc_sample.run()
 
@@ -115,11 +115,14 @@ def get_average(sc):
     dbdata = []
     for gpusamples in samples:
         avg = gpusamples[-1].copy()
-        for sample in gpusamples[:-1]:
-            for field in db_fields:
-                avg[field] = float(avg[field]) + float(sample[field])
         for field in db_fields:
-            avg[field] /= len(gpusamples)
+            for sample in gpusamples[:-1]:
+                try:
+                    avg[field] = float(avg[field]) + float(sample[field])
+                except Exception as e:
+                    avg[field] = -1
+                    break
+                avg[field] /= len(gpusamples)
         logger.debug('Average: ' + str(avg))
         dbdata.append(avg)
 

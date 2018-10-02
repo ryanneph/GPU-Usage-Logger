@@ -1,0 +1,16 @@
+[Unit]
+Description=GPU Usage Logger MongoDB instance
+Before=gpu-usage-logger.service
+
+[Service]
+Type=forking
+ExecStart=/usr/bin/mongod --dbpath /raid/ryanneph/opt/GPU-Usage-Logger/test_db --logpath /raid/ryanneph/opt/GPU-Usage-Logger/test_db/log/mongodb.log --port 27117 --fork
+ExecStop=/usr/bin/mongod --dbpath /raid/ryanneph/opt/GPU-Usage-Logger/test_db --shutdown
+PIDFile=/raid/ryanneph/opt/GPU-Usage-Logger/test_db/mongod.lock
+
+Restart=on-failure
+RestartSec=20s
+
+[Install]
+WantedBy=multi-user.target
+
